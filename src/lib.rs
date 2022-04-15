@@ -46,6 +46,8 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+extern crate core;
+
 use bytes::{Bytes, BytesMut};
 use futures_core::{ready, Stream, TryStream};
 use futures_sink::Sink;
@@ -73,6 +75,7 @@ use std::{
 /// use tokio_serde::Serializer;
 /// use bytes::{Buf, Bytes, BytesMut, BufMut};
 /// use std::pin::Pin;
+/// use bincode_crate::Options;
 ///
 /// struct IntSerializer {
 ///     width: usize,
@@ -145,6 +148,7 @@ pub trait Serializer<T> {
 /// use tokio_serde::Deserializer;
 /// use bytes::{BytesMut, Buf};
 /// use std::pin::Pin;
+/// use bincode_crate::Options;
 ///
 /// struct IntDeserializer {
 ///     width: usize,
@@ -314,13 +318,16 @@ pub type SymmetricallyFramed<Transport, Value, Codec> = Framed<Transport, Value,
     feature = "json",
     feature = "bincode",
     feature = "messagepack",
-    feature = "cbor"
+    feature = "cbor",
+    feature = "encrypted_bincode"
 ))]
 pub mod formats {
     #[cfg(feature = "bincode")]
     pub use self::bincode::*;
     #[cfg(feature = "cbor")]
     pub use self::cbor::*;
+    #[cfg(feature = "encrypted_bincode")]
+    pub use self::encrypted_bincode::*;
     #[cfg(feature = "json")]
     pub use self::json::*;
     #[cfg(feature = "messagepack")]
@@ -329,13 +336,121 @@ pub mod formats {
     use super::{Deserializer, Serializer};
     use bytes::{Bytes, BytesMut};
     use educe::Educe;
-    use serde::{Deserialize, Serialize};
+    pub(crate) use serde::{Deserialize, Serialize};
     use std::{marker::PhantomData, pin::Pin};
 
+    #[cfg(feature = "encrypted_bincode")]
+    mod encrypted_bincode {
+        use super::*;
+        use bincode_crate::config::Options;
+        use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
+        use chacha20poly1305::aead::{Aead, NewAead};
+        use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+        use std::io;
+        use std::io::ErrorKind;
+        use zeroize::{Zeroize, ZeroizeOnDrop};
+
+        fn gen_key() -> Vec<u8> {
+            let mut res = Key::default();
+            let mut rng = OsRng::default();
+            rng.fill_bytes(&mut res);
+            res.to_vec()
+        }
+        /// Encrypted bincode codec using [bincode](https://docs.rs/bincode) crate
+        /// for serialization and [chacha20poly1305](https://docs.rs/chacha20poly1305) for encryption.
+        #[cfg_attr(docsrs, doc(cfg(feature = "encrypted_bincode")))]
+        #[derive(Educe, Zeroize, ZeroizeOnDrop)]
+        #[educe(Debug)]
+        pub struct EncryptedBincode<Item, SinkItem, O = bincode_crate::DefaultOptions> {
+            #[zeroize(skip)]
+            #[educe(Debug(ignore))]
+            options: O,
+            #[zeroize(skip)]
+            #[educe(Debug(ignore))]
+            ghost: PhantomData<(Item, SinkItem)>,
+            #[educe(Debug(ignore))]
+            key: Vec<u8>,
+        }
+
+        impl<Item, SinkItem> Default for EncryptedBincode<Item, SinkItem> {
+            fn default() -> Self {
+                EncryptedBincode {
+                    options: Default::default(),
+                    ghost: PhantomData,
+                    key: gen_key(),
+                }
+            }
+        }
+
+        impl<Item, SinkItem, O> From<O> for EncryptedBincode<Item, SinkItem, O>
+        where
+            O: Options,
+        {
+            fn from(options: O) -> Self {
+                Self {
+                    options,
+                    ghost: PhantomData,
+                    key: gen_key(),
+                }
+            }
+        }
+
+        #[cfg_attr(docsrs, doc(cfg(feature = "encrypted_bincode")))]
+        pub type SymmetricalEncryptedBincode<T, O = bincode_crate::DefaultOptions> =
+            EncryptedBincode<T, T, O>;
+
+        impl<Item, SinkItem, O> Deserializer<Item> for EncryptedBincode<Item, SinkItem, O>
+        where
+            for<'a> Item: Deserialize<'a>,
+            O: Options + Clone,
+        {
+            type Error = io::Error;
+
+            fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
+                let nonce = XNonce::from_slice(&src[..24]);
+                let chacha: XChaCha20Poly1305 = XChaCha20Poly1305::new(Key::from_slice(&self.key));
+                let data = chacha
+                    .decrypt(nonce, &src[24..])
+                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+                self.options
+                    .clone()
+                    .deserialize(&data)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            }
+        }
+
+        impl<Item, SinkItem, O> Serializer<SinkItem> for EncryptedBincode<Item, SinkItem, O>
+        where
+            SinkItem: Serialize,
+            O: Options + Clone,
+        {
+            type Error = io::Error;
+
+            fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
+                let mut nonce = XNonce::default();
+                let mut rng = OsRng::default();
+                rng.fill_bytes(&mut nonce);
+                let key = Key::from_slice(self.key.as_slice());
+                let cipher = XChaCha20Poly1305::new(key);
+                let mut res = nonce.to_vec();
+                let ser = self
+                    .options
+                    .clone()
+                    .serialize(&item)
+                    .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
+                let mut other = cipher
+                    .encrypt(&nonce, ser.as_slice())
+                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+                res.append(&mut other);
+                Ok(Bytes::from(res))
+            }
+        }
+    }
     #[cfg(feature = "bincode")]
     mod bincode {
         use super::*;
         use bincode_crate::config::Options;
+        use serde::{Deserialize, Serialize};
         use std::io;
 
         /// Bincode codec using [bincode](https://docs.rs/bincode) crate.
@@ -381,11 +496,10 @@ pub mod formats {
             type Error = io::Error;
 
             fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
-                Ok(self
-                    .options
+                self.options
                     .clone()
                     .deserialize(src)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             }
         }
 
@@ -411,6 +525,7 @@ pub mod formats {
     mod json {
         use super::*;
         use bytes::Buf;
+        use serde::{Deserialize, Serialize};
 
         /// JSON codec using [serde_json](https://docs.rs/serde_json) crate.
         #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
@@ -451,6 +566,7 @@ pub mod formats {
     mod messagepack {
         use super::*;
         use bytes::Buf;
+        use serde::{Deserialize, Serialize};
         use std::io;
 
         /// MessagePack codec using [rmp-serde](https://docs.rs/rmp-serde) crate.
@@ -472,8 +588,8 @@ pub mod formats {
             type Error = io::Error;
 
             fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
-                Ok(rmp_serde::from_read(std::io::Cursor::new(src).reader())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?)
+                rmp_serde::from_read(std::io::Cursor::new(src).reader())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             }
         }
 
@@ -494,6 +610,7 @@ pub mod formats {
     #[cfg(feature = "cbor")]
     mod cbor {
         use super::*;
+        use serde::{Deserialize, Serialize};
         use std::io;
 
         /// CBOR codec using [serde_cbor](https://docs.rs/serde_cbor) crate.
@@ -557,6 +674,18 @@ pub mod formats {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "encrypted_bincode")]
+    #[test]
+    fn enc_bincode_impls() {
+        use impls::impls;
+        use std::fmt::Debug;
+
+        struct Nothing;
+        type T = crate::formats::EncryptedBincode<Nothing, Nothing>;
+
+        assert!(impls!(T: Debug));
+        assert!(impls!(T: Default));
+    }
     #[cfg(feature = "bincode")]
     #[test]
     fn bincode_impls() {
