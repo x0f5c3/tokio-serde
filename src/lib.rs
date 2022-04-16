@@ -348,28 +348,40 @@ pub mod formats {
         use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
         use std::io;
         use std::io::ErrorKind;
-        use zeroize::{Zeroize, ZeroizeOnDrop};
+        use secrecy::{ExposeSecret, Secret};
 
-        fn gen_key() -> Vec<u8> {
+        fn gen_key() -> Secret<Vec<u8>> {
             let mut res = Key::default();
             let mut rng = OsRng::default();
             rng.fill_bytes(&mut res);
-            res.to_vec()
+            Secret::new(res.to_vec())
         }
         /// Encrypted bincode codec using [bincode](https://docs.rs/bincode) crate
         /// for serialization and [chacha20poly1305](https://docs.rs/chacha20poly1305) for encryption.
         #[cfg_attr(docsrs, doc(cfg(feature = "encrypted_bincode")))]
-        #[derive(Educe, Zeroize, ZeroizeOnDrop)]
+        #[derive(Educe)]
         #[educe(Debug)]
         pub struct EncryptedBincode<Item, SinkItem, O = bincode_crate::DefaultOptions> {
-            #[zeroize(skip)]
             #[educe(Debug(ignore))]
             options: O,
-            #[zeroize(skip)]
             #[educe(Debug(ignore))]
             ghost: PhantomData<(Item, SinkItem)>,
             #[educe(Debug(ignore))]
-            key: Vec<u8>,
+            key: Secret<Vec<u8>>,
+        }
+
+        impl<Item, SinkItem, O> EncryptedBincode<Item, SinkItem, O>
+        where
+            O: Options
+        {
+            pub fn new(key: Vec<u8>, opts: O) -> Self {
+                let key = Secret::new(key);
+                    Self {
+                        options: opts,
+                        ghost: PhantomData,
+                        key
+                    }
+            }
         }
 
         impl<Item, SinkItem> Default for EncryptedBincode<Item, SinkItem> {
@@ -408,7 +420,7 @@ pub mod formats {
 
             fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
                 let nonce = XNonce::from_slice(&src[..24]);
-                let chacha: XChaCha20Poly1305 = XChaCha20Poly1305::new(Key::from_slice(&self.key));
+                let chacha: XChaCha20Poly1305 = XChaCha20Poly1305::new(Key::from_slice(self.key.expose_secret()));
                 let data = chacha
                     .decrypt(nonce, &src[24..])
                     .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
@@ -430,7 +442,7 @@ pub mod formats {
                 let mut nonce = XNonce::default();
                 let mut rng = OsRng::default();
                 rng.fill_bytes(&mut nonce);
-                let key = Key::from_slice(self.key.as_slice());
+                let key = Key::from_slice(self.key.expose_secret());
                 let cipher = XChaCha20Poly1305::new(key);
                 let mut res = nonce.to_vec();
                 let ser = self
