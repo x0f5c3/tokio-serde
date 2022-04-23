@@ -374,10 +374,10 @@ pub mod formats {
         where
             O: Options
         {
-            pub fn new(key: Vec<u8>, opts: O) -> Self {
+            pub fn new(key: Vec<u8>, opts: Option<O>) -> Self {
                 let key = Secret::new(key);
                     Self {
-                        options: opts,
+                        options: opts.unwrap_or(bincode_crate::DefaultOptions::default()),
                         ghost: PhantomData,
                         key
                     }
